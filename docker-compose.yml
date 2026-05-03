@@ -1,0 +1,116 @@
+version: "3.9"
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  StreamBot — Full Stack Docker Compose               ║
+# ║  Services: bot | worker | beat | redis | dashboard   ║
+# ╚══════════════════════════════════════════════════════╝
+
+x-common: &common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  env_file: ../.env
+  restart: unless-stopped
+  networks:
+    - streambot
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1
+      --loglevel warning
+    volumes:
+      - redis_data:/data
+    networks:
+      - streambot
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Telegram Bot ───────────────────────────────────────────────────────────
+  bot:
+    <<: *common
+    container_name: streambot_bot
+    command: python -m bot.main
+    volumes:
+      - recordings:/data
+      - logs:/var/log/streambot
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Celery Worker (normal queue) ───────────────────────────────────────────
+  worker:
+    <<: *common
+    container_name: streambot_worker
+    command: >
+      celery -A workers.celery_app worker
+      --loglevel=info
+      --queues=normal,priority
+      --concurrency=4
+      --max-tasks-per-child=50
+      --hostname=worker@%h
+    volumes:
+      - recordings:/data
+      - logs:/var/log/streambot
+    environment:
+      - C_FORCE_ROOT=false
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+
+  # ── Celery Beat (periodic tasks) ───────────────────────────────────────────
+  beat:
+    <<: *common
+    container_name: streambot_beat
+    command: >
+      celery -A workers.celery_app beat
+      --loglevel=info
+      --scheduler celery.beat:PersistentScheduler
+    volumes:
+      - beat_data:/app/celerybeat-schedule
+      - logs:/var/log/streambot
+
+  # ── FastAPI Dashboard (optional) ───────────────────────────────────────────
+  dashboard:
+    <<: *common
+    container_name: streambot_dashboard
+    command: >
+      uvicorn api.dashboard:app
+      --host 0.0.0.0
+      --port 8080
+      --workers 2
+      --access-log
+    ports:
+      - "8080:8080"
+    profiles:
+      - dashboard    # only started with: docker compose --profile dashboard up
+
+volumes:
+  redis_data:
+  recordings:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/streambot/recordings   # change to your storage path
+  logs:
+  beat_data:
+
+networks:
+  streambot:
+    driver: bridge
